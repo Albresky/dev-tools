@@ -1,90 +1,77 @@
-#!/bin/bash
+#!/usr/bin/env sh
 
-AGENT_NAME="${USER}@$(hostname)"
-SOCKET_FILE="${HOME}/.ssh/ssh-agent.sock"
-ENV_FILE="${HOME}/.ssh/ssh-agent.env"
-LOCK_FILE="${HOME}/.ssh/ssh-agent.lock"
+# ==============================================================================
+# SSH Agent Loader
+# Compatibility: sh, bash, zsh
+# ==============================================================================
 
-KEYS_TO_ADD=(
-    "${HOME}/.ssh/id_rsa_baidu"
-    "${HOME}/.ssh/id_ed25519_github"
-)
+_auto_load_ssh_agent() {
+    # --- Configs ---
+    local SSH_ENV="$HOME/.ssh/agent.env"
+    # solit with space
+    local KEYS_TO_ADD="$HOME/.ssh/id_ed25519_github"
 
-echo -e "\n==== 检查 ssh-agent 状态 [$AGENT_NAME] ===="
+    _log() {
+        printf "=> [SSH] %s\n" "$*"
+    }
+    
+    _start_agent() {
+        _log "Launching NEW ssh-agent..."
+        ssh-agent -s > "$SSH_ENV"
+        chmod 600 "$SSH_ENV"
+        . "$SSH_ENV" > /dev/null
+    }
 
-exec 200>"$LOCK_FILE"
-flock -n 200 || {
-    echo "==== ⏳ 等待其他进程释放 ssh-agent 锁... ===="
-    flock 200
-}
+    if [ -n "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+        if [ -z "$SSH_AGENT_PID" ]; then
+            _log "External Forward Agent Detected (Socket: $SSH_AUTH_SOCK)"
+        fi
+    else
+        if [ -f "$SSH_ENV" ]; then
+            . "$SSH_ENV" > /dev/null
+        fi
 
-try_load_agent() {
-    if [[ -f "$ENV_FILE" ]]; then
-        source "$ENV_FILE" >/dev/null
-
-        if [[ -n "$SSH_AGENT_PID" ]] && \
-           kill -0 "$SSH_AGENT_PID" 2>/dev/null && \
-           [[ -S "$SSH_AUTH_SOCK" ]]; then
-            echo "==== ✅ 成功加载已存在的 ssh-agent (PID: $SSH_AGENT_PID) ===="
-            return 0
+        if [ -n "$SSH_AGENT_PID" ] && kill -0 "$SSH_AGENT_PID" 2>/dev/null; then
+             _log "Reusing Alive Agent (PID: $SSH_AGENT_PID)"
         else
-            echo "==== ⚠️ 检测到无效或过期的 agent 记录，正在清理... ===="
-            rm -f "$ENV_FILE" "$SOCKET_FILE"
-            return 1
+            _start_agent
         fi
     fi
-    return 1
-}
 
-add_keys() {
-    echo "==== 🔍 检查需要添加的 SSH 密钥... ===="
-    
+    if ! command -v ssh-add >/dev/null 2>&1; then
+        _log "Error: ssh-add command not found"
+        return 0
+    fi
+
     local loaded_fingerprints
-    loaded_fingerprints=$(ssh-add -l)
+    loaded_fingerprints=$(ssh-add -l 2>/dev/null)
 
-    for key_path in "${KEYS_TO_ADD[@]}"; do
-        if [[ -f "$key_path" ]]; then
+    if [ -n "$ZSH_VERSION" ]; then
+        setopt localoptions shwordsplit 2>/dev/null
+    fi
+
+    for key in $KEYS_TO_ADD; do
+        if [ -f "$key" ]; then
             local key_fingerprint
-            key_fingerprint=$(ssh-keygen -lf "$key_path" | awk '{print $2}')
-            
-            if ! echo "$loaded_fingerprints" | grep -qF "$key_fingerprint"; then
-                echo "==== ➕ 正在添加密钥: $key_path ===="
-                ssh-add "$key_path"
+            key_fingerprint=$(ssh-keygen -lf "$key" 2>/dev/null | awk '{print $2}')
+
+            if [ -z "$key_fingerprint" ]; then
+                 _log "Warning: Failed in Reading fingerprint: $key"
+                 continue
+            fi
+
+            if echo "$loaded_fingerprints" | grep -qF "$key_fingerprint"; then
+                _log "Skipping loading fingerprint (exists already): $(basename "$key")"
             else
-                echo "==== 👍 密钥已加载: $key_path ===="
+                _log "Adding Key: $key"
+                ssh-add "$key"
             fi
         else
-            : # no-hop
+            _log "Error: Failed in Finding Key: $key"
         fi
     done
 }
 
-start_new_agent() {
-    echo "==== 🚀 启动新的 ssh-agent... ===="
-    
-    ssh-agent -a "$SOCKET_FILE" > "$ENV_FILE"
-    
-    source "$ENV_FILE" >/dev/null
-    
-    if [[ -S "$SSH_AUTH_SOCK" ]] && [[ -n "$SSH_AGENT_PID" ]]; then
-        echo "==== ✅ 新 ssh-agent 启动成功 (PID: $SSH_AGENT_PID) ===="
-        return 0
-    else
-        echo "==== ❌ ssh-agent 启动失败! ===="
-        return 1
-    fi
-}
+_auto_load_ssh_agent
 
-if ! try_load_agent; then
-    if ! start_new_agent; then
-        flock -u 200
-        echo -e "==== ❗ 无法初始化 ssh-agent，请检查权限或系统问题。 ====\n"
-        exit 1
-    fi
-fi
-
-add_keys
-
-flock -u 200
-
-echo -e "==== ssh-agent 状态检查完成 ====\n"
+unset -f _auto_load_ssh_agent
